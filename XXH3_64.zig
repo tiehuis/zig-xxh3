@@ -47,12 +47,14 @@ fn readIntLittle(comptime T: type, buf: []const u8) T {
 
 // Intrinsics
 
-inline fn mul32to64(lhs: u64, rhs: u64) u64 {
-    return @as(u32, @truncate(lhs)) *% @as(u32, @truncate(rhs));
+inline fn mul32to64(lhs: u32, rhs: u32) u64 {
+    const l: u64 = lhs;
+    const r: u64 = rhs;
+    return l *% r;
 }
 
 inline fn mul32to64_add64(lhs: u64, rhs: u64, acc: u64) u64 {
-    return mul32to64(lhs, rhs) +% acc;
+    return mul32to64(@truncate(lhs), @truncate(rhs)) +% acc;
 }
 
 inline fn mul128_fold64(lo: u64, hi: u64) u64 {
@@ -121,7 +123,7 @@ inline fn len_9to16(input: []const u8, secret: []const u8, seed: u64) u64 {
     const input_lo = readIntLittle(u64, input[0..]) ^ bitflip1;
     const input_hi = readIntLittle(u64, input[input.len - 8 ..]) ^ bitflip2;
     const acc = input.len +% @byteSwap(input_lo) +% input_hi +% mul128_fold64(input_lo, input_hi);
-    return xxh64_avalanche(acc);
+    return xxh3_avalanche(acc);
 }
 
 inline fn len_0to16(input: []const u8, secret: []const u8, seed: u64) u64 {
@@ -173,16 +175,19 @@ inline fn len_129to240(input: []const u8, secret: []const u8, seed: u64) u64 {
     const MIDSIZE_STARTOFFSET = 3;
     const MIDSIZE_LASTOFFSET = 17;
 
-    const nb_rounds = @divFloor(input.len, 16);
+    const nb_rounds = input.len / 16;
     assert(nb_rounds >= 8);
 
-    const acc: u64 = xxh3_avalanche(input.len *% PRIME64_1);
+    var acc: u64 = input.len *% PRIME64_1;
+    for (0..8) |i| {
+        acc +%= mix16(input[16 * i ..], secret[16 * i ..], seed);
+    }
+    acc = xxh3_avalanche(acc);
 
     var acc_end: u64 = mix16(input[input.len - 16 ..], secret[SECRET_SIZE_MIN - MIDSIZE_LASTOFFSET ..], seed);
     for (8..nb_rounds) |i| {
         acc_end +%= mix16(input[16 * i ..], secret[16 * (i - 8) + MIDSIZE_STARTOFFSET ..], seed);
     }
-
     return xxh3_avalanche(acc +% acc_end);
 }
 
@@ -192,6 +197,18 @@ const STRIPE_LEN = 64;
 const SECRET_CONSUME_RATE = 8;
 const ACC_NB = STRIPE_LEN / @sizeOf(u64);
 const PREFETCH_DIST = 256; // use std.prefetch
+
+fn hashLong(impl: anytype, input: []const u8, secret: []const u8, seed: u64) u64 {
+    if (seed == 0) {
+        return hashLongInternal(impl, input, secret);
+    } else {
+        // TODO: Need to use custom secret if requested. Does the initSecret change to
+        // base off the custom? Right now we always use the default when generating.
+        var custom_secret: [SECRET_DEFAULT_SIZE]u8 align(SEC_ALIGN) = undefined;
+        impl.initSecret(&custom_secret, seed);
+        return hashLongInternal(impl, input, &custom_secret);
+    }
+}
 
 inline fn hashLongInternal(impl: anytype, input: []const u8, secret: []const u8) u64 {
     const SECRET_MERGEACCS_START = 11;
@@ -220,11 +237,14 @@ inline fn hashLongInternalLoop(impl: anytype, acc: *align(64) [ACC_NB]u64, input
     impl.accumulate(acc, input[nb_blocks * block_len ..], secret, nb_stripes);
 
     const SECRET_LASTACC_START = 7;
-    scalar.accumulate512(acc, input[input.len - STRIPE_LEN ..], secret[secret.len - STRIPE_LEN - SECRET_LASTACC_START ..]);
+    impl.accumulate512(acc, input[input.len - STRIPE_LEN ..], secret[secret.len - STRIPE_LEN - SECRET_LASTACC_START ..]);
 }
 
 inline fn mixAccumulators(acc: *[2]u64, secret: []const u8) u64 {
-    return mul128_fold64(acc[0] ^ readIntLittle(u64, secret[0..]), acc[1] ^ readIntLittle(u64, secret[8..]));
+    return mul128_fold64(
+        acc[0] ^ readIntLittle(u64, secret[0..]),
+        acc[1] ^ readIntLittle(u64, secret[8..]),
+    );
 }
 
 inline fn mergeAccumulators(acc: *[ACC_NB]u64, secret: []const u8, start: u64) u64 {
@@ -255,7 +275,7 @@ const scalar = struct {
     inline fn accumulate(acc: *align(64) [ACC_NB]u64, input: []const u8, secret: []const u8, nb_stripes: usize) void {
         for (0..nb_stripes) |n| {
             const in = input[n * STRIPE_LEN ..];
-            @prefetch(in[PREFETCH_DIST..], .{});
+            @prefetch(in[PREFETCH_DIST..].ptr, .{});
             accumulate512(acc, in, secret[n * SECRET_CONSUME_RATE ..]);
         }
     }
@@ -296,25 +316,16 @@ const Options = struct {
     secret: []const u8 = &DEFAULT_SECRET,
 };
 
-fn hashLong(impl: anytype, input: []const u8, options: Options) u64 {
-    if (options.seed == 0) {
-        return hashLongInternal(impl, input, options.secret);
-    } else {
-        // TODO: Need to use custom secret if requested. Does the initSecret change to
-        // base off the custom? Right now we always use the default when generating.
-        var secret: [SECRET_DEFAULT_SIZE]u8 align(SEC_ALIGN) = undefined;
-        impl.initSecret(&secret, options.seed);
-        return hashLongInternal(impl, input, &secret);
-    }
+fn getImpl() type {
+    return scalar;
 }
 
 fn hash(input: []const u8, options: Options) u64 {
-    var secret = options.secret;
     return switch (input.len) {
-        else => hashLong(scalar, input, options),
-        129...240 => len_129to240(input, secret, options.seed),
-        17...128 => len_17to128(input, secret, options.seed),
-        0...16 => len_0to16(input, secret, options.seed),
+        else => hashLong(getImpl(), input, options.secret, options.seed),
+        129...240 => len_129to240(input, options.secret, options.seed),
+        17...128 => len_17to128(input, options.secret, options.seed),
+        0...16 => len_0to16(input, options.secret, options.seed),
     };
 }
 
