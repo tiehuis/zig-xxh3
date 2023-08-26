@@ -9,6 +9,11 @@ comptime {
     assert(SECRET_DEFAULT_SIZE >= SECRET_SIZE_MIN);
 }
 
+const STRIPE_LEN = 64;
+const SECRET_CONSUME_RATE = 8;
+const ACC_NB = STRIPE_LEN / @sizeOf(u64);
+const PREFETCH_DIST = 256; // use std.prefetch
+
 const DEFAULT_SECRET: [SECRET_DEFAULT_SIZE]u8 align(SEC_ALIGN) = .{
     0xb8, 0xfe, 0x6c, 0x39, 0x23, 0xa4, 0x4b, 0xbe, 0x7c, 0x01, 0x81, 0x2c, 0xf7, 0x21, 0xad, 0x1c,
     0xde, 0xd4, 0x6d, 0xe9, 0x83, 0x90, 0x97, 0xdb, 0x72, 0x40, 0xa4, 0xa4, 0xb7, 0xb3, 0x67, 0x1f,
@@ -39,13 +44,11 @@ const PRIME64_3 = 0x165667B19E3779F9; // 0b0001011001010110011001111011000110011
 const PRIME64_4 = 0x85EBCA77C2B2AE63; // 0b1000010111101011110010100111011111000010101100101010111001100011
 const PRIME64_5 = 0x27D4EB2F165667C5; // 0b0010011111010100111010110010111100010110010101100110011111000101
 
-// Memory
+// Core
 
 fn readIntLittle(comptime T: type, buf: []const u8) T {
     return std.mem.readIntLittle(T, &buf[0..@sizeOf(T)].*);
 }
-
-// Intrinsics
 
 inline fn mul32to64(lhs: u32, rhs: u32) u64 {
     const l: u64 = lhs;
@@ -91,138 +94,6 @@ inline fn xxh3_rrmxmx(h_: u64, len: u64) u64 {
     return h ^ (h >> 28);
 }
 
-// Short Keys
-
-inline fn len_1to3(input: []const u8, secret: []const u8, seed: u64) u64 {
-    assert(1 <= input.len and input.len <= 3);
-    const c1: u32 = input[0];
-    const c2: u32 = input[input.len >> 1];
-    const c3: u32 = input[input.len - 1];
-    const combined: u32 = @intCast((c1 << 16) | (c2 << 24) | (c3 << 0) | (input.len << 8));
-    const bitflip: u64 = @as(u64, readIntLittle(u32, secret) ^ readIntLittle(u32, secret[4..])) +% seed;
-    const keyed: u64 = @as(u64, combined) ^ bitflip;
-    return xxh64_avalanche(keyed);
-}
-
-inline fn len_4to8(input: []const u8, secret: []const u8, seed_: u64) u64 {
-    assert(4 <= input.len and input.len <= 8);
-    const seed_swapped: u64 = @byteSwap(@as(u32, @truncate(seed_)));
-    const seed = seed_ ^ (seed_swapped << 32);
-    const input1 = readIntLittle(u32, input[0..]);
-    const input2 = readIntLittle(u32, input[input.len - 4 ..]);
-    const bitflip = (readIntLittle(u64, secret[8..]) ^ readIntLittle(u64, secret[16..])) -% seed;
-    const input64 = input2 +% (@as(u64, input1) << 32);
-    const keyed = input64 ^ bitflip;
-    return xxh3_rrmxmx(keyed, input.len);
-}
-
-inline fn len_9to16(input: []const u8, secret: []const u8, seed: u64) u64 {
-    assert(9 <= input.len and input.len <= 16);
-    const bitflip1 = (readIntLittle(u64, secret[24..]) ^ readIntLittle(u64, secret[32..])) +% seed;
-    const bitflip2 = (readIntLittle(u64, secret[40..]) ^ readIntLittle(u64, secret[48..])) -% seed;
-    const input_lo = readIntLittle(u64, input[0..]) ^ bitflip1;
-    const input_hi = readIntLittle(u64, input[input.len - 8 ..]) ^ bitflip2;
-    const acc = input.len +% @byteSwap(input_lo) +% input_hi +% mul128_fold64(input_lo, input_hi);
-    return xxh3_avalanche(acc);
-}
-
-inline fn len_0to16(input: []const u8, secret: []const u8, seed: u64) u64 {
-    return switch (input.len) {
-        else => unreachable,
-        9...16 => len_9to16(input, secret, seed),
-        4...8 => len_4to8(input, secret, seed),
-        1...3 => len_1to3(input, secret, seed),
-        0 => xxh64_avalanche(seed ^ (readIntLittle(u64, secret[56..]) ^ readIntLittle(u64, secret[64..]))),
-    };
-}
-
-inline fn mix16(input: []const u8, secret: []const u8, seed: u64) u64 {
-    assert(input.len >= 16);
-    const input_lo = readIntLittle(u64, input[0..]);
-    const input_hi = readIntLittle(u64, input[8..]);
-    return mul128_fold64(
-        input_lo ^ (readIntLittle(u64, secret[0..]) +% seed),
-        input_hi ^ (readIntLittle(u64, secret[8..]) -% seed),
-    );
-}
-
-inline fn len_17to128(input: []const u8, secret: []const u8, seed: u64) u64 {
-    assert(secret.len >= SECRET_SIZE_MIN);
-    assert(16 < input.len and input.len <= 128);
-    var acc: u64 = input.len *% PRIME64_1;
-    if (input.len > 32) {
-        if (input.len > 64) {
-            if (input.len > 96) {
-                acc +%= mix16(input[48..], secret[96..], seed);
-                acc +%= mix16(input[input.len - 64 ..], secret[112..], seed);
-            }
-            acc +%= mix16(input[32..], secret[64..], seed);
-            acc +%= mix16(input[input.len - 48 ..], secret[80..], seed);
-        }
-        acc +%= mix16(input[16..], secret[32..], seed);
-        acc +%= mix16(input[input.len - 32 ..], secret[48..], seed);
-    }
-    acc +%= mix16(input[0..], secret[0..], seed);
-    acc +%= mix16(input[input.len - 16 ..], secret[16..], seed);
-    return xxh3_avalanche(acc);
-}
-
-const MIDSIZE_MAX = 240;
-
-inline fn len_129to240(input: []const u8, secret: []const u8, seed: u64) u64 {
-    assert(secret.len >= SECRET_SIZE_MIN);
-    assert(128 < input.len and input.len <= MIDSIZE_MAX);
-    const MIDSIZE_STARTOFFSET = 3;
-    const MIDSIZE_LASTOFFSET = 17;
-
-    const nb_rounds = input.len / 16;
-    assert(nb_rounds >= 8);
-
-    var acc: u64 = input.len *% PRIME64_1;
-    for (0..8) |i| {
-        acc +%= mix16(input[16 * i ..], secret[16 * i ..], seed);
-    }
-    acc = xxh3_avalanche(acc);
-
-    var acc_end: u64 = mix16(input[input.len - 16 ..], secret[SECRET_SIZE_MIN - MIDSIZE_LASTOFFSET ..], seed);
-    for (8..nb_rounds) |i| {
-        acc_end +%= mix16(input[16 * i ..], secret[16 * (i - 8) + MIDSIZE_STARTOFFSET ..], seed);
-    }
-    return xxh3_avalanche(acc +% acc_end);
-}
-
-// Long Keys
-
-const STRIPE_LEN = 64;
-const SECRET_CONSUME_RATE = 8;
-const ACC_NB = STRIPE_LEN / @sizeOf(u64);
-const PREFETCH_DIST = 256; // use std.prefetch
-
-fn hashLong(impl: anytype, input: []const u8, secret: []const u8, seed: u64) u64 {
-    if (seed == 0) {
-        return hashLongInternal(impl, input, secret);
-    } else {
-        // TODO: Need to use custom secret if requested. Does the initSecret change to
-        // base off the custom? Right now we always use the default when generating.
-        var custom_secret: [SECRET_DEFAULT_SIZE]u8 align(SEC_ALIGN) = undefined;
-        impl.initSecret(&custom_secret, seed);
-        return hashLongInternal(impl, input, &custom_secret);
-    }
-}
-
-inline fn hashLongInternal(impl: anytype, input: []const u8, secret: []const u8) u64 {
-    const SECRET_MERGEACCS_START = 11;
-
-    var acc: [ACC_NB]u64 align(64) = .{
-        PRIME32_3, PRIME64_1, PRIME64_2, PRIME64_3,
-        PRIME64_4, PRIME32_2, PRIME64_5, PRIME32_1,
-    };
-
-    assert(secret.len >= @sizeOf(@TypeOf(acc)) + SECRET_MERGEACCS_START);
-    hashLongInternalLoop(impl, &acc, input, secret);
-    return mergeAccumulators(&acc, secret[SECRET_MERGEACCS_START..], input.len *% PRIME64_1);
-}
-
 inline fn hashLongInternalLoop(impl: anytype, acc: *align(64) [ACC_NB]u64, input: []const u8, secret: []const u8) void {
     assert(secret.len >= SECRET_SIZE_MIN);
 
@@ -258,6 +129,149 @@ inline fn mergeAccumulators(acc: *[ACC_NB]u64, secret: []const u8, start: u64) u
     }
     return xxh3_avalanche(r);
 }
+
+pub const XXH3_64 = struct {
+    pub const Options = struct {
+        seed: u64 = 0,
+        secret: []const u8 = &DEFAULT_SECRET,
+    };
+
+    pub fn hash(input: []const u8, options: Options) u64 {
+        return switch (input.len) {
+            else => hashLong(getImpl(), input, options.secret, options.seed),
+            129...240 => len_129to240(input, options.secret, options.seed),
+            17...128 => len_17to128(input, options.secret, options.seed),
+            0...16 => len_0to16(input, options.secret, options.seed),
+        };
+    }
+
+    // Short Keys
+
+    inline fn len_1to3(input: []const u8, secret: []const u8, seed: u64) u64 {
+        assert(1 <= input.len and input.len <= 3);
+        const c1: u32 = input[0];
+        const c2: u32 = input[input.len >> 1];
+        const c3: u32 = input[input.len - 1];
+        const combined: u32 = @intCast((c1 << 16) | (c2 << 24) | (c3 << 0) | (input.len << 8));
+        const bitflip: u64 = @as(u64, readIntLittle(u32, secret) ^ readIntLittle(u32, secret[4..])) +% seed;
+        const keyed: u64 = @as(u64, combined) ^ bitflip;
+        return xxh64_avalanche(keyed);
+    }
+
+    inline fn len_4to8(input: []const u8, secret: []const u8, seed_: u64) u64 {
+        assert(4 <= input.len and input.len <= 8);
+        const seed_swapped: u64 = @byteSwap(@as(u32, @truncate(seed_)));
+        const seed = seed_ ^ (seed_swapped << 32);
+        const input1 = readIntLittle(u32, input[0..]);
+        const input2 = readIntLittle(u32, input[input.len - 4 ..]);
+        const bitflip = (readIntLittle(u64, secret[8..]) ^ readIntLittle(u64, secret[16..])) -% seed;
+        const input64 = input2 +% (@as(u64, input1) << 32);
+        const keyed = input64 ^ bitflip;
+        return xxh3_rrmxmx(keyed, input.len);
+    }
+
+    inline fn len_9to16(input: []const u8, secret: []const u8, seed: u64) u64 {
+        assert(9 <= input.len and input.len <= 16);
+        const bitflip1 = (readIntLittle(u64, secret[24..]) ^ readIntLittle(u64, secret[32..])) +% seed;
+        const bitflip2 = (readIntLittle(u64, secret[40..]) ^ readIntLittle(u64, secret[48..])) -% seed;
+        const input_lo = readIntLittle(u64, input[0..]) ^ bitflip1;
+        const input_hi = readIntLittle(u64, input[input.len - 8 ..]) ^ bitflip2;
+        const acc = input.len +% @byteSwap(input_lo) +% input_hi +% mul128_fold64(input_lo, input_hi);
+        return xxh3_avalanche(acc);
+    }
+
+    inline fn len_0to16(input: []const u8, secret: []const u8, seed: u64) u64 {
+        return switch (input.len) {
+            else => unreachable,
+            9...16 => len_9to16(input, secret, seed),
+            4...8 => len_4to8(input, secret, seed),
+            1...3 => len_1to3(input, secret, seed),
+            0 => xxh64_avalanche(seed ^ (readIntLittle(u64, secret[56..]) ^ readIntLittle(u64, secret[64..]))),
+        };
+    }
+
+    inline fn mix16(input: []const u8, secret: []const u8, seed: u64) u64 {
+        assert(input.len >= 16);
+        const input_lo = readIntLittle(u64, input[0..]);
+        const input_hi = readIntLittle(u64, input[8..]);
+        return mul128_fold64(
+            input_lo ^ (readIntLittle(u64, secret[0..]) +% seed),
+            input_hi ^ (readIntLittle(u64, secret[8..]) -% seed),
+        );
+    }
+
+    inline fn len_17to128(input: []const u8, secret: []const u8, seed: u64) u64 {
+        assert(secret.len >= SECRET_SIZE_MIN);
+        assert(16 < input.len and input.len <= 128);
+        var acc: u64 = input.len *% PRIME64_1;
+        if (input.len > 32) {
+            if (input.len > 64) {
+                if (input.len > 96) {
+                    acc +%= mix16(input[48..], secret[96..], seed);
+                    acc +%= mix16(input[input.len - 64 ..], secret[112..], seed);
+                }
+                acc +%= mix16(input[32..], secret[64..], seed);
+                acc +%= mix16(input[input.len - 48 ..], secret[80..], seed);
+            }
+            acc +%= mix16(input[16..], secret[32..], seed);
+            acc +%= mix16(input[input.len - 32 ..], secret[48..], seed);
+        }
+        acc +%= mix16(input[0..], secret[0..], seed);
+        acc +%= mix16(input[input.len - 16 ..], secret[16..], seed);
+        return xxh3_avalanche(acc);
+    }
+
+    const MIDSIZE_MAX = 240;
+
+    inline fn len_129to240(input: []const u8, secret: []const u8, seed: u64) u64 {
+        assert(secret.len >= SECRET_SIZE_MIN);
+        assert(128 < input.len and input.len <= MIDSIZE_MAX);
+        const MIDSIZE_STARTOFFSET = 3;
+        const MIDSIZE_LASTOFFSET = 17;
+
+        const nb_rounds = input.len / 16;
+        assert(nb_rounds >= 8);
+
+        var acc: u64 = input.len *% PRIME64_1;
+        for (0..8) |i| {
+            acc +%= mix16(input[16 * i ..], secret[16 * i ..], seed);
+        }
+        acc = xxh3_avalanche(acc);
+
+        var acc_end: u64 = mix16(input[input.len - 16 ..], secret[SECRET_SIZE_MIN - MIDSIZE_LASTOFFSET ..], seed);
+        for (8..nb_rounds) |i| {
+            acc_end +%= mix16(input[16 * i ..], secret[16 * (i - 8) + MIDSIZE_STARTOFFSET ..], seed);
+        }
+        return xxh3_avalanche(acc +% acc_end);
+    }
+
+    // Long Keys
+
+    fn hashLong(impl: anytype, input: []const u8, secret: []const u8, seed: u64) u64 {
+        if (seed == 0) {
+            return hashLongInternal(impl, input, secret);
+        } else {
+            // TODO: Need to use custom secret if requested. Does the initSecret change to
+            // base off the custom? Right now we always use the default when generating.
+            var custom_secret: [SECRET_DEFAULT_SIZE]u8 align(SEC_ALIGN) = undefined;
+            impl.initSecret(&custom_secret, seed);
+            return hashLongInternal(impl, input, &custom_secret);
+        }
+    }
+
+    inline fn hashLongInternal(impl: anytype, input: []const u8, secret: []const u8) u64 {
+        const SECRET_MERGEACCS_START = 11;
+
+        var acc: [ACC_NB]u64 align(64) = .{
+            PRIME32_3, PRIME64_1, PRIME64_2, PRIME64_3,
+            PRIME64_4, PRIME32_2, PRIME64_5, PRIME32_1,
+        };
+
+        assert(secret.len >= @sizeOf(@TypeOf(acc)) + SECRET_MERGEACCS_START);
+        hashLongInternalLoop(impl, &acc, input, secret);
+        return mergeAccumulators(&acc, secret[SECRET_MERGEACCS_START..], input.len *% PRIME64_1);
+    }
+};
 
 // XXH3 scalar/generic implementation
 
@@ -313,39 +327,21 @@ const scalar = struct {
     }
 };
 
-// Public API
-
-const Options = struct {
-    seed: u64 = 0,
-    secret: []const u8 = &DEFAULT_SECRET,
-};
-
 fn getImpl() type {
     return scalar;
 }
-
-fn hash(input: []const u8, options: Options) u64 {
-    return switch (input.len) {
-        else => hashLong(getImpl(), input, options.secret, options.seed),
-        129...240 => len_129to240(input, options.secret, options.seed),
-        17...128 => len_17to128(input, options.secret, options.seed),
-        0...16 => len_0to16(input, options.secret, options.seed),
-    };
-}
-
-// Misc
 
 test "xxh3_64" {
     const seed = 0;
     const to_hash = "1234";
     const result = 0xd8316e61d84f6ba4;
-    try std.testing.expectEqual(hash(to_hash, .{ .seed = seed }), result);
+    try std.testing.expectEqual(XXH3_64.hash(to_hash, .{ .seed = seed }), result);
 }
 
 pub fn main() !void {
     const buf = "a" ** 1024;
     for (0..1024) |i| {
-        const zig_r = hash(buf[0..i], .{});
+        const zig_r = XXH3_64.hash(buf[0..i], .{});
         std.debug.print("{:0>3}: {x}\n", .{ i, zig_r });
     }
 }
