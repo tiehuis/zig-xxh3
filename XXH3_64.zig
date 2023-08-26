@@ -213,7 +213,11 @@ fn hashLong(impl: anytype, input: []const u8, secret: []const u8, seed: u64) u64
 inline fn hashLongInternal(impl: anytype, input: []const u8, secret: []const u8) u64 {
     const SECRET_MERGEACCS_START = 11;
 
-    var acc: [ACC_NB]u64 align(64) = .{};
+    var acc: [ACC_NB]u64 align(64) = .{
+        PRIME32_3, PRIME64_1, PRIME64_2, PRIME64_3,
+        PRIME64_4, PRIME32_2, PRIME64_5, PRIME32_1,
+    };
+
     assert(secret.len >= @sizeOf(@TypeOf(acc)) + SECRET_MERGEACCS_START);
     hashLongInternalLoop(impl, &acc, input, secret);
     return mergeAccumulators(&acc, secret[SECRET_MERGEACCS_START..], input.len *% PRIME64_1);
@@ -275,7 +279,7 @@ const scalar = struct {
     inline fn accumulate(acc: *align(64) [ACC_NB]u64, input: []const u8, secret: []const u8, nb_stripes: usize) void {
         for (0..nb_stripes) |n| {
             const in = input[n * STRIPE_LEN ..];
-            @prefetch(in[PREFETCH_DIST..].ptr, .{});
+            @prefetch(in.ptr, .{});
             accumulate512(acc, in, secret[n * SECRET_CONSUME_RATE ..]);
         }
     }
@@ -339,8 +343,8 @@ test "xxh3_64" {
 }
 
 pub fn main() !void {
-    const buf = "a" ** 256;
-    inline for (0..240) |i| {
+    const buf = "a" ** 1024;
+    for (0..1024) |i| {
         const zig_r = hash(buf[0..i], .{});
         std.debug.print("{:0>3}: {x}\n", .{ i, zig_r });
     }
