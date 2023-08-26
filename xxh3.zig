@@ -94,7 +94,7 @@ inline fn xxh3_rrmxmx(h_: u64, len: u64) u64 {
     return h ^ (h >> 28);
 }
 
-inline fn hashLongInternalLoop(impl: anytype, acc: *align(64) [ACC_NB]u64, input: []const u8, secret: []const u8) void {
+inline fn hashLongInternalLoop(impl: anytype, acc: *Accumulator, input: []const u8, secret: []const u8) void {
     assert(secret.len >= SECRET_SIZE_MIN);
 
     const nb_stripes_per_block = (secret.len - STRIPE_LEN) / SECRET_CONSUME_RATE;
@@ -122,13 +122,24 @@ inline fn mixAccumulators(acc: *[2]u64, secret: []const u8) u64 {
     );
 }
 
-inline fn mergeAccumulators(acc: *[ACC_NB]u64, secret: []const u8, start: u64) u64 {
+inline fn mergeAccumulators(acc: *Accumulator, secret: []const u8, start: u64) u64 {
     var r = start;
     for (0..4) |i| {
-        r +%= mixAccumulators(acc[2 * i ..][0..2], secret[16 * i ..]);
+        r +%= mixAccumulators(acc.e[2 * i ..][0..2], secret[16 * i ..]);
     }
     return xxh3_avalanche(r);
 }
+
+pub const Accumulator = struct {
+    e: [ACC_NB]u64 align(64),
+
+    pub fn init() Accumulator {
+        return .{ .e = .{
+            PRIME32_3, PRIME64_1, PRIME64_2, PRIME64_3,
+            PRIME64_4, PRIME32_2, PRIME64_5, PRIME32_1,
+        } };
+    }
+};
 
 pub const XXH3_64 = struct {
     pub const Options = struct {
@@ -262,11 +273,7 @@ pub const XXH3_64 = struct {
     inline fn hashLongInternal(impl: anytype, input: []const u8, secret: []const u8) u64 {
         const SECRET_MERGEACCS_START = 11;
 
-        var acc: [ACC_NB]u64 align(64) = .{
-            PRIME32_3, PRIME64_1, PRIME64_2, PRIME64_3,
-            PRIME64_4, PRIME32_2, PRIME64_5, PRIME32_1,
-        };
-
+        var acc = Accumulator.init();
         assert(secret.len >= @sizeOf(@TypeOf(acc)) + SECRET_MERGEACCS_START);
         hashLongInternalLoop(impl, &acc, input, secret);
         return mergeAccumulators(&acc, secret[SECRET_MERGEACCS_START..], input.len *% PRIME64_1);
@@ -276,21 +283,21 @@ pub const XXH3_64 = struct {
 // XXH3 scalar/generic implementation
 
 const scalar = struct {
-    inline fn accumulateRound(acc: *align(64) [ACC_NB]u64, input: []const u8, secret: []const u8, lane: usize) void {
+    inline fn accumulateRound(acc: *Accumulator, input: []const u8, secret: []const u8, lane: usize) void {
         assert(lane < ACC_NB);
         const val = readIntLittle(u64, input[lane * 8 ..]);
         const key = val ^ readIntLittle(u64, secret[lane * 8 ..]);
-        acc[lane ^ 1] +%= val;
-        acc[lane] = mul32to64_add64(key, key >> 32, acc[lane]);
+        acc.e[lane ^ 1] +%= val;
+        acc.e[lane] = mul32to64_add64(key, key >> 32, acc.e[lane]);
     }
 
-    inline fn accumulate512(acc: *align(64) [ACC_NB]u64, input: []const u8, secret: []const u8) void {
+    inline fn accumulate512(acc: *Accumulator, input: []const u8, secret: []const u8) void {
         for (0..ACC_NB) |i| {
             accumulateRound(acc, input, secret, i);
         }
     }
 
-    inline fn accumulate(acc: *align(64) [ACC_NB]u64, input: []const u8, secret: []const u8, nb_stripes: usize) void {
+    inline fn accumulate(acc: *Accumulator, input: []const u8, secret: []const u8, nb_stripes: usize) void {
         for (0..nb_stripes) |n| {
             const in = input[n * STRIPE_LEN ..];
             @prefetch(in.ptr, .{});
@@ -298,18 +305,18 @@ const scalar = struct {
         }
     }
 
-    inline fn scrambleRound(acc: *align(64) [ACC_NB]u64, secret: []const u8, lane: usize) void {
+    inline fn scrambleRound(acc: *Accumulator, secret: []const u8, lane: usize) void {
         // TODO: assert acc is aligned
         assert(lane < ACC_NB);
         const key = readIntLittle(u64, secret[lane * 8 ..]);
-        var a = acc[lane];
+        var a = acc.e[lane];
         a ^= (a >> 47);
         a ^= key;
         a *%= PRIME32_1;
-        acc[lane] = a;
+        acc.e[lane] = a;
     }
 
-    inline fn scramble(acc: *align(64) [ACC_NB]u64, secret: []const u8) void {
+    inline fn scramble(acc: *Accumulator, secret: []const u8) void {
         for (0..ACC_NB) |i| {
             scrambleRound(acc, secret, i);
         }
